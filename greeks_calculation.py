@@ -4,15 +4,26 @@
 #BASED ON: OPTIONPY (GREEKS CALCULATION) - https://github.com/ibaris/optionpy/tree/main/optionpy
 #MAIN PURPOSE: GREEK CALCULATION FOR CBOE RAW DATA
 
-import pandas as pd
+#V.20 - OWN CALCULATION GREEKS BASED ON OPTIONPY BUT ALL IN POLARS
+
 import numpy as np
-import optionpy as opy
 import scipy.misc
 import cvxpy as cp
 import polars as pl
 
 
-pd.options.display.width = None
+pl.Config(
+    set_fmt_float="full",
+    tbl_cell_numeric_alignment="RIGHT",
+    thousands_separator=",",
+    tbl_width_chars=200,
+    fmt_str_lengths=1000,
+    set_tbl_cols=-1,
+    set_tbl_rows=-1,
+    set_tbl_hide_column_data_types=True,
+    set_tbl_hide_dataframe_shape=True
+
+)
 
 _gaussian = scipy.stats.norm()
 _N_cdf = _gaussian.cdf
@@ -228,15 +239,19 @@ def solve_marks(chain, S0, dte, obj_weight=0., int_rate=None, div_yld=None):
     )
     prob.solve()
 
-    marks = pd.DataFrame(dict(eps_call=np.array(eps_call.value),
-                              eps_put=np.array(eps_put.value),
-                              mark_call=np.array(C.value),
-                              mark_put=np.array(P.value),
-                              strike=chain['strike']
-                            ),
-                            index=chain['strike'])
-    marks['diff_call'] = marks.eps_call * spr_call
-    marks['diff_put'] = marks.eps_put * spr_put
+    marks = (pl.DataFrame({
+                'eps_call': np.array(eps_call.value),
+                'eps_put': np.array(eps_put.value),
+                'mark_call': np.array(C.value),
+                'mark_put': np.array(P.value),
+                'strike': chain['strike']
+                }
+                )
+                .with_columns(
+                    diff_call=pl.col('eps_call') * pl.lit(spr_call),
+                    diff_put=pl.col('eps_put') * pl.lit(spr_put),
+                )
+    )
 
     return dict(
         delta=delta.value,
@@ -248,126 +263,160 @@ def solve_marks(chain, S0, dte, obj_weight=0., int_rate=None, div_yld=None):
         marks=marks,
     )
 
-# GREEKS CALCULATION BASED ON OPTIONPY
-def spot_greeks_from(clean_marks):
-    S = clean_marks.spot
-    K = clean_marks.strike
-    # ZMIANA KOLUMNY 'IS_CALL' NA 1/-1 (POD OPTIONPY) ZAMIAST 1/0 (METODA ALS)
-    #flag = clean_marks.is_call
-    flag = 1 * (clean_marks.option_type=='C') -1 * ((clean_marks.option_type!='C'))
-    t = clean_marks.dte
-    iv = clean_marks.imp_vol
-    r = clean_marks.int_rate
-    q = clean_marks.div_yld
-    tau = clean_marks.tau
-
-    calc = opy.Option(kind=flag, s0=S, k=K, r=r, sigma=iv, t=t, q=q)
-
-    ref_tau=1./12.
-    wt_vega = np.sqrt(ref_tau / tau) * calc['Vega']
-
-    return dict(
-      price=calc['Fair Value'],
-      delta=calc['Delta'],
-      theta=calc['Theta'],
-      vega=calc['Vega'],
-      wt_vega=wt_vega,
-      gamma=calc['Gamma'],
-    )
-
-
 
 #read one of sample files from CBOE shop - to be downloades from its shop
 filename = 'cboe/UnderlyingOptionsIntervals_1800sec_calcs_oi_2021-04-26.csv'
 
 
 #read all columns using polars
-option_data = pl\
-    .scan_csv(filename)\
-    .filter(pl.col('underlying_symbol') == "A")\
-    .with_columns(
-        (pl.col("expiration").str.strptime(pl.Datetime, "%Y-%m-%d") - pl.col("quote_datetime").str.strptime(pl.Datetime, "%Y-%m-%d %H:%M:%S")).dt.days().alias('dte'),
-        (pl.col('option_type') == 'C').alias('is_call'),
-        (0.5 * (pl.col('bid') + pl.col('ask'))).alias('mid'),
-        (pl.col('ask') - pl.col('bid')).alias('spread')
-    )\
-    .with_columns( (pl.col('dte') / 365.).alias('tau'))\
-    .collect()
+option_data = (pl
+                .scan_csv(filename)
+                .filter(pl.col('underlying_symbol') == "A")
+                .with_columns(
+                    dte=(pl.col("expiration").str.strptime(pl.Datetime, "%Y-%m-%d") - pl.col("quote_datetime").str.strptime(pl.Datetime, "%Y-%m-%d %H:%M:%S")).dt.total_days(),
+                    is_call=(pl.col('option_type') == 'C'),
+                    mid=(pl.lit(0.5) * (pl.col('bid') + pl.col('ask'))),
+                    spread=(pl.col('ask') - pl.col('bid'))
+                )
+                .with_columns(
+                    tau=(pl.col('dte') / pl.lit(_DAYS_PER_YEAR))
+                    )
+                .collect()
+               )
 
-snapshots = option_data['quote_datetime'].unique()
+snapshots = sorted(option_data['quote_datetime'].unique())
 S0 = 900
 
 '''code to calculate interest rate, dividend yield and IV also taken from Adam Lee Speight examples, modified for the use of polars library'''
 snapshot_list = []
 for snapshot in snapshots:
-    sel_option_data = option_data.filter(pl.col('quote_datetime') == snapshot)
+    sel_option_data = (option_data
+                       .filter(pl.col('quote_datetime') == snapshot)
+                       )
     dtes = sorted(sel_option_data['dte'].unique())
 
-    chains = sel_option_data.select(['strike', 'dte', 'option_type', 'bid', 'ask', 'is_call', 'tau', 'mid', 'spread'])
+    chains = (sel_option_data
+              .select(['strike', 'dte', 'option_type', 'bid', 'ask', 'is_call', 'tau', 'mid', 'spread'])
+              )
 
     marks_by_dte = {}
     for dte in dtes:
-        df = chains.clone()
-        chain = df.filter(pl.col('dte') == dte)\
-            .filter((pl.col('dte').is_not_nan() & pl.col('bid').is_not_nan() & pl.col('ask').is_not_nan()))\
-            .pivot(index='strike', columns='option_type', values=['dte', 'bid', 'ask', 'mid', 'spread'], aggregate_function=None).sort('strike')
+        chain = (chains
+                 .filter((pl.col('dte') == dte) & pl.col('dte').is_not_nan() & pl.col('bid').is_not_nan() & pl.col('ask').is_not_nan())
+                 .pivot(index='strike', columns='option_type', values=['dte', 'bid', 'ask', 'mid', 'spread'], aggregate_function=None).sort('strike')
+                 )
 
         marks_by_dte[dte] = solve_marks(chain, S0=S0, dte=dte, obj_weight=0.)
 
-    rates = pd.DataFrame.from_records([
-        (dte, dte / 365., data['r'], data['F'])
+
+    rates = pl.DataFrame([
+        (dte, dte / _DAYS_PER_YEAR, data['r'], data['F'])
         for dte, data in marks_by_dte.items()
-    ], columns=['dte', 'tau', 'int_rate', 'fwd']).set_index('dte')
-    rates['spot'] = rates.fwd.iloc[0]  # use front month fwd as proxy for spot
-    rates['div_yld'] = [np.log(rates.loc[dte].spot / data['F']) / (rates.loc[dte].tau) + data['r']
+    ])
+    rates.columns = ['dte', 'tau', 'int_rate', 'fwd']
+    rates = (rates
+             .with_columns(
+                spot=pl.col('fwd').first() # use front month fwd as proxy for spot
+                )
+             )
+
+    yieldd = [np.log(rates.filter(pl.col('dte') == dte)['spot'][0] / data['F']) / (rates.filter(pl.col('dte') == dte)['tau'][0]) + data['r']
                         for dte, data in marks_by_dte.items()]
+
+    rates = (rates
+             .with_columns(
+                div_yld=pl.Series(yieldd)
+            )
+    )
 
     marks_list = []
     for dte, data in marks_by_dte.items():
-        marks = data['marks'][['mark_call', 'mark_put']].copy()
-        marks.columns = ['C', 'P']
-        marks.columns.name = 'option_type'
-        marks = marks.stack().to_frame('mark')
-        marks['dte'] = dte
-        marks_list.append(marks.reset_index().rename(columns={'level_0':'strike'}))
+        marks = (data['marks'][['strike', 'mark_call', 'mark_put']]
+                 .clone()
+                 .rename({'mark_call':'C', 'mark_put':'P'})
+                 .melt(id_vars='strike', value_vars=['C', 'P'])
+                 .sort('strike')
+                 .with_columns(dte=pl.lit(dte))
+                 .rename({'variable':'option_type', 'value':'mark'})
+                 )
+        marks_list.append(marks)
 
-    clean_marks = pd.merge(
-        pd.concat(marks_list, axis=0, ignore_index=True),
-        rates[['tau', 'int_rate', 'div_yld', 'spot']],
-        on='dte')
-    clean_marks['is_call'] = (clean_marks.option_type == 'C')
+    clean_marks = (pl.concat(marks_list).with_columns(dte=pl.col('dte').cast(pl.Int64))
+                    .join(rates[['dte', 'tau', 'int_rate', 'div_yld', 'spot']],
+                    on='dte', how='left')
+                   .with_columns(
+                    is_call=pl.when(pl.col('option_type') == 'C').then(pl.lit(True)).otherwise(pl.lit(False)),
+                    flag=pl.when(pl.col('option_type') == 'C').then(pl.lit(1)).otherwise(pl.lit(-1))
+                    )
+                )
 
-    clean_marks['imp_vol'] = spot_compute_iv(
-        tgt=clean_marks.mark,
-        spot=clean_marks.spot,
-        strike=clean_marks.strike,
-        tau=clean_marks.tau,
-        is_call=clean_marks.is_call,
-        int_rate=clean_marks.int_rate,
-        div_yld=clean_marks.div_yld,
+    imp_vol = spot_compute_iv(
+                            tgt=clean_marks['mark'],
+                            spot=clean_marks['spot'],
+                            strike=clean_marks['strike'],
+                            tau=clean_marks['tau'],
+                            is_call=clean_marks['is_call'],
+                            int_rate=clean_marks['int_rate'],
+                            div_yld=clean_marks['div_yld'],
+                            )
+
+    #compute own greeks based on optionpy
+    clean_marks = (clean_marks
+                    .with_columns(
+                        imp_vol=pl.Series(imp_vol)
+                    )
+                    .with_columns(
+                        d1=(
+                                   np.log(pl.col('spot') / pl.col('strike')) +
+                                   (pl.col('int_rate') - pl.col('div_yld') + pl.lit(.5) * pl.col('imp_vol').pow(2)) * pl.col('tau')
+                           ) /
+                           (
+                                   (pl.col('imp_vol') * np.sqrt(pl.col('tau'))) + pl.lit(1e-6)
+                           )
+                        )
+                    .with_columns(
+                        d2=(
+                                pl.col('d1') - ((pl.col('imp_vol') * np.sqrt(pl.col('tau'))) + pl.lit(1e-6))
+                            )
+                        )
+                    .with_columns(
+                        nd1=scipy.special.ndtr(pl.col('flag') * pl.col('d1')),
+                        nd2=scipy.special.ndtr(pl.col('flag') * pl.col('d2')),
+                        phi_d1=scipy.stats.norm._pdf(pl.col('d1'))
+                        )
+                    .with_columns(
+                        price=pl.col('flag') * pl.col('spot') * np.exp(-pl.col('div_yld') * pl.col('tau')) * pl.col('nd1') -
+                              pl.col('flag') * pl.col('strike') * np.exp(-pl.col('int_rate') * pl.col('tau')) * pl.col('nd2'),
+                        delta=pl.col('flag') * np.exp(-pl.col('div_yld') * pl.col('tau')) * pl.col('nd1'),
+                        vega=pl.col('spot') * np.exp(-pl.col('div_yld') * pl.col('tau')) * scipy.stats.norm._pdf(pl.col('d1')) * np.sqrt(pl.col('tau')) * pl.lit(0.01),
+                        gamma=np.exp(-1 * pl.col('div_yld') * pl.col('tau')) * pl.col('phi_d1') / (pl.col('spot') * pl.col('imp_vol') * np.sqrt(pl.col('tau'))),
+                        theta=(
+                                -np.exp(-pl.col('div_yld') * pl.col('tau')) * (pl.col('spot') * pl.col('phi_d1') * pl.col('imp_vol')) / (pl.lit(2) * np.sqrt(pl.col('tau'))) +
+                                -pl.col('flag') * pl.col('int_rate') * pl.col('strike') * np.exp(-pl.col('int_rate') * pl.col('tau')) * pl.col('nd2') +
+                                -pl.col('flag') * pl.col('div_yld') * pl.col('spot') * np.exp(-pl.col('div_yld') * pl.col('tau')) * pl.col('nd1')
+                                ) / pl.lit(365),
+                     )
+                    .select(pl.all().exclude('d1', 'd2', 'nd1', 'nd2', 'phi_d1'))
+                    # per ALS adjust for the 100 multiplier
+                    # per ALS note that vega needs no adjustment
+                    .with_columns(
+                        wt_vega=(pl.lit(1./12.) / pl.col('tau')).sqrt() * pl.col('vega'),
+                        value=pl.lit(100) * pl.col('price'),
+                        theta=pl.lit(100) * pl.col('theta'),
+                        delta=pl.lit(100) * pl.col('delta'),
+                        quote_datetime=pl.lit(snapshot)
+                    )
     )
-
-    # compute greeks for each option using optionPy
-    greeks = spot_greeks_from(clean_marks)
-
-    for c in ['price', 'delta', 'theta', 'gamma', 'vega', 'wt_vega']:
-        clean_marks[c] = greeks[c]
-
-    # per ALS adjust for the 100 multiplier
-    # per ALS note that vega needs no adjustment
-    clean_marks['value'] = 100 * clean_marks['price']  # value per contract
-    #clean_marks['theta'] *= 100 / 365.  # per contract
-    clean_marks['theta'] *= 100  # per contract
-    clean_marks['delta'] *= 100  # per contract
-
-    clean_marks['quote_datetime'] = snapshot
 
     snapshot_list.append(clean_marks)
 
-final_data = pd.concat(snapshot_list)
+final_data = pl.concat(snapshot_list)
 
-#print(f'{option_data.shape} {final_data.shape} ')
-#print of selested strikes
-print(final_data[(final_data.quote_datetime == '2021-04-26 16:00:00') & (final_data.strike == 130)])
+print(final_data
+        .filter(
+                (pl.col('quote_datetime') == '2021-04-26 16:00:00') &
+                (pl.col('strike') == 130)
+            )
+)
 
 
