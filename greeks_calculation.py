@@ -4,7 +4,7 @@
 #BASED ON: OPTIONPY (GREEKS CALCULATION) - https://github.com/ibaris/optionpy/tree/main/optionpy
 #MAIN PURPOSE: GREEK CALCULATION FOR CBOE RAW DATA
 
-#V.20 - OWN CALCULATION GREEKS BASED ON OPTIONPY BUT ALL IN POLARS
+#V.21 - OWN CALCULATION GREEKS BASED ON OPTIONPY BUT ALL IN POLARS
 
 import numpy as np
 import scipy.misc
@@ -212,11 +212,11 @@ def solve_marks(chain, S0, dte, obj_weight=0., int_rate=None, div_yld=None):
     D = 1-delta
     K = chain['strike'].to_numpy()
 
-    m_call = chain['mid_option_type_C'].to_numpy()
-    m_put = chain['mid_option_type_P'].to_numpy()
+    m_call = chain['mid_C'].to_numpy()
+    m_put = chain['mid_P'].to_numpy()
 
-    spr_call = chain['spread_option_type_C'].to_numpy()
-    spr_put = chain['spread_option_type_P'].to_numpy()
+    spr_call = chain['spread_C'].to_numpy()
+    spr_put = chain['spread_P'].to_numpy()
 
     C = m_call + cp.multiply(spr_call, eps_call)
     P = m_put + cp.multiply(spr_put, eps_put)
@@ -303,8 +303,9 @@ for snapshot in snapshots:
     for dte in dtes:
         chain = (chains
                  .filter((pl.col('dte') == dte) & pl.col('dte').is_not_nan() & pl.col('bid').is_not_nan() & pl.col('ask').is_not_nan())
-                 .pivot(index='strike', columns='option_type', values=['dte', 'bid', 'ask', 'mid', 'spread'], aggregate_function=None).sort('strike')
+                 .pivot(index='strike', on='option_type', values=['dte', 'bid', 'ask', 'mid', 'spread'], aggregate_function=None).sort('strike')
                  )
+
 
         marks_by_dte[dte] = solve_marks(chain, S0=S0, dte=dte, obj_weight=0.)
 
@@ -312,7 +313,7 @@ for snapshot in snapshots:
     rates = pl.DataFrame([
         (dte, dte / _DAYS_PER_YEAR, data['r'], data['F'])
         for dte, data in marks_by_dte.items()
-    ])
+    ], orient="row")
     rates.columns = ['dte', 'tau', 'int_rate', 'fwd']
     rates = (rates
              .with_columns(
@@ -334,19 +335,21 @@ for snapshot in snapshots:
         marks = (data['marks'][['strike', 'mark_call', 'mark_put']]
                  .clone()
                  .rename({'mark_call':'C', 'mark_put':'P'})
-                 .melt(id_vars='strike', value_vars=['C', 'P'])
+                 .unpivot(index='strike', on=['C', 'P'])
                  .sort('strike')
                  .with_columns(dte=pl.lit(dte))
                  .rename({'variable':'option_type', 'value':'mark'})
                  )
         marks_list.append(marks)
 
-    clean_marks = (pl.concat(marks_list).with_columns(dte=pl.col('dte').cast(pl.Int64))
+    clean_marks = (pl
+                    .concat(marks_list)
+                    .with_columns(dte=pl.col('dte').cast(pl.Int64))
                     .join(rates[['dte', 'tau', 'int_rate', 'div_yld', 'spot']],
-                    on='dte', how='left')
+                        on='dte', how='left')
                    .with_columns(
-                    is_call=pl.when(pl.col('option_type') == 'C').then(pl.lit(True)).otherwise(pl.lit(False)),
-                    flag=pl.when(pl.col('option_type') == 'C').then(pl.lit(1)).otherwise(pl.lit(-1))
+                        is_call=pl.when(pl.col('option_type') == 'C').then(pl.lit(True)).otherwise(pl.lit(False)),
+                        flag=pl.when(pl.col('option_type') == 'C').then(pl.lit(1)).otherwise(pl.lit(-1))
                     )
                 )
 
